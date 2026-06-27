@@ -1,0 +1,243 @@
+/*
+  ================================================================
+  AgroIoT — Sistema de Irrigação Inteligente
+  Firmware para ESP32 DevKit v1 + Arduino IoT Cloud
+  (TUDO EM UM ÚNICO ARQUIVO .ino — apenas 5 Cloud Variables)
+  ================================================================
+  Equipe: Rafael Passos | Aloísio Smith | Sergio Sobral
+  Professor: Moisés Araujo Oliveira
+
+  Sensores:
+    - Umidade do solo (capacitivo/resistivo) -> entrada analógica (ADC)
+    - DHT22 (AM2302)                          -> temperatura e umidade do ar
+    - YF-S201 (sensor de fluxo de água)        -> pulsos por interrupção (uso local, NÃO vai pra nuvem)
+
+  Atuador:
+    - Mini Bomba 12V -> acionada via 1 Relé
+
+  Comunicação:
+    - Wi-Fi + Arduino IoT Cloud
+
+  ------------------------------------------------------------------
+  CLOUD VARIABLES (apenas as 5 principais vão para a nuvem)
+  ------------------------------------------------------------------
+  Crie o "Thing" no painel cloud.arduino.cc e cadastre EXATAMENTE
+  estas 5 Cloud Variables (mesmo nome e tipo):
+
+    Nome               | Tipo  | Permissão
+    -------------------|-------|------------------
+    umidadeSolo        | float | Read Only
+    temperatura        | float | Read Only
+    umidadeAr          | float | Read Only
+    bombaLigada        | bool  | Read & Write
+    alertaDesperdicio  | bool  | Read Only
+
+  As demais variáveis do sistema (vazão, total de litros, modo
+  automático/manual, limites de umidade) continuam existindo no
+  firmware, mas como variáveis LOCAIS — não são mais sincronizadas
+  com a nuvem. O modo de operação e os limites de irrigação (antes
+  ajustáveis pelo dashboard) agora são fixos no código (ver
+  MODO_AUTOMATICO e LIMITE_UMIDADE_MIN/MAX abaixo).
+
+  Depois de criar o Thing e associar seu ESP32, copie o
+  DEVICE_LOGIN_NAME e o DEVICE_KEY gerados pela plataforma para as
+  constantes abaixo (seção "CREDENCIAIS ARDUINO IOT CLOUD").
+  ================================================================
+*/
+
+#include <ArduinoIoTCloud.h>
+#include <Arduino_ConnectionHandler.h>
+#include <DHT.h>
+
+// ===================== CREDENCIAIS WI-FI =====================
+const char SSID[] = "NOME_DA_SUA_REDE";
+const char PASS[] = "SENHA_DA_SUA_REDE";
+
+// ===================== CREDENCIAIS ARDUINO IOT CLOUD =====================
+const char DEVICE_LOGIN_NAME[] = "SEU_DEVICE_ID_AQUI";
+const char DEVICE_KEY[]        = "SUA_DEVICE_KEY_AQUI";
+
+// ===================== PINOS =====================
+#define PIN_SOLO_ADC     34   // ADC1_CH6 - entrada apenas (ideal para sensores analógicos)
+#define PIN_DHT22        4
+#define PIN_FLUXO        27   // entrada de interrupção (pulsos do YF-S201) - uso local
+#define PIN_RELE_BOMBA   26   // saída digital -> relé da mini bomba 12V
+
+#define DHTTYPE DHT22
+
+// ===================== CALIBRAÇÃO DO SOLO =====================
+// Ajuste lendo o ADC com o sensor seco (ao ar) e em água/solo saturado.
+// ADC do ESP32: 0 a 4095 (12 bits)
+const int ADC_SOLO_SECO  = 3000;  // valor lido no ar / solo seco
+const int ADC_SOLO_UMIDO = 1200;  // valor lido em solo saturado / água
+
+// ===================== SENSOR DE FLUXO YF-S201 (uso local) =====================
+// Fator de conversão típico do YF-S201: ~7.5 pulsos por segundo a cada 1 L/min
+const float FATOR_CALIBRACAO_FLUXO = 7.5;
+
+// ===================== MODO DE OPERAÇÃO E LIMITES DE IRRIGAÇÃO (fixos no código) =====================
+const bool  MODO_AUTOMATICO    = true; // true = sistema decide sozinho; false = só controle manual via bombaLigada
+const float LIMITE_UMIDADE_MIN = 30.0; // % abaixo do qual a bomba liga (modo automático)
+const float LIMITE_UMIDADE_MAX = 70.0; // % acima do qual a bomba desliga (modo automático)
+
+// ===================== INTERVALOS =====================
+const unsigned long INTERVALO_LEITURA_MS = 5000; // leitura de sensores e atualização da nuvem
+
+// =====================================================================
+// CLOUD VARIABLES — apenas as 5 principais (equivalente ao thingProperties.h)
+// =====================================================================
+float umidadeSolo;
+float temperatura;
+float umidadeAr;
+bool  bombaLigada;
+bool  alertaDesperdicio;
+
+void onBombaLigadaChange();
+
+void initProperties() {
+  ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
+  ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
+
+  ArduinoCloud.addProperty(umidadeSolo, READ, 5 * SECONDS, NULL);
+  ArduinoCloud.addProperty(temperatura, READ, 5 * SECONDS, NULL);
+  ArduinoCloud.addProperty(umidadeAr, READ, 5 * SECONDS, NULL);
+  ArduinoCloud.addProperty(alertaDesperdicio, READ, 5 * SECONDS, NULL);
+
+  ArduinoCloud.addProperty(bombaLigada, READWRITE, ON_CHANGE, onBombaLigadaChange);
+}
+
+WiFiConnectionHandler ArduinoIoTPreferredConnection(SSID, PASS);
+
+// =====================================================================
+// VARIÁVEIS INTERNAS DO FIRMWARE (não vão para a nuvem)
+// =====================================================================
+DHT dht(PIN_DHT22, DHTTYPE);
+
+volatile unsigned long pulseCount = 0;
+unsigned long ultimaLeitura = 0;
+unsigned long totalLitrosML = 0; // acumulado interno em mL (mais precisão)
+
+float vazaoLPM_local = 0;
+float totalLitros_local = 0;
+
+// ===================== INTERRUPÇÃO DO SENSOR DE FLUXO =====================
+void IRAM_ATTR contarPulso() {
+  pulseCount++;
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  pinMode(PIN_RELE_BOMBA, OUTPUT);
+  digitalWrite(PIN_RELE_BOMBA, LOW);
+
+  pinMode(PIN_FLUXO, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_FLUXO), contarPulso, FALLING);
+
+  dht.begin();
+
+  // Valores padrão antes de sincronizar com a nuvem
+  bombaLigada = false;
+  alertaDesperdicio = false;
+
+  // --- Conexão com o Arduino IoT Cloud ---
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  Serial.println("=== AgroIoT - Sistema de Irrigacao Inteligente (Arduino IoT Cloud) ===");
+}
+
+// ===================== LOOP PRINCIPAL =====================
+void loop() {
+  ArduinoCloud.update();
+
+  if (millis() - ultimaLeitura >= INTERVALO_LEITURA_MS) {
+    ultimaLeitura = millis();
+    cicloDeLeitura();
+  }
+}
+
+// ===================== LEITURA DE SENSORES E LÓGICA =====================
+void cicloDeLeitura() {
+  // --- Umidade do solo ---
+  int leituraAdc = analogRead(PIN_SOLO_ADC);
+  float umidade = mapFloat(leituraAdc, ADC_SOLO_SECO, ADC_SOLO_UMIDO, 0, 100);
+  umidade = constrain(umidade, 0, 100);
+  umidadeSolo = umidade; // atualiza Cloud Variable
+
+  // --- DHT22 ---
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  bool dhtOk = !isnan(t) && !isnan(h);
+  if (dhtOk) {
+    temperatura = t;   // atualiza Cloud Variable
+    umidadeAr = h;     // atualiza Cloud Variable
+  } else {
+    Serial.println("Falha na leitura do DHT22.");
+  }
+
+  // --- Fluxo de água (YF-S201) — uso local apenas ---
+  unsigned long pulsos = pulseCount;
+  pulseCount = 0;
+
+  float segundos = INTERVALO_LEITURA_MS / 1000.0;
+  float frequenciaHz = pulsos / segundos;
+  float vazao = frequenciaHz / FATOR_CALIBRACAO_FLUXO; // L/min
+  float litrosNoIntervalo = vazao * (segundos / 60.0);
+  totalLitrosML += (unsigned long)(litrosNoIntervalo * 1000);
+
+  vazaoLPM_local = vazao;
+  totalLitros_local = totalLitrosML / 1000.0;
+
+  // --- Lógica de irrigação automática ---
+  if (MODO_AUTOMATICO) {
+    if (umidadeSolo < LIMITE_UMIDADE_MIN) {
+      acionarBomba(true);
+    } else if (umidadeSolo >= LIMITE_UMIDADE_MAX) {
+      acionarBomba(false);
+    }
+  } else {
+    // Modo manual: o estado de bombaLigada já é aplicado direto
+    // pelo callback onBombaLigadaChange() quando o usuário muda
+    // pelo dashboard.
+  }
+
+  // --- Alerta simples de desperdício (agora é Cloud Variable) ---
+  alertaDesperdicio = bombaLigada && (vazaoLPM_local < 0.05);
+
+  // --- Log local ---
+  Serial.println("---------------------------------------------");
+  Serial.printf("Umidade do solo: %.1f %% (ADC: %d)\n", umidadeSolo, leituraAdc);
+  if (dhtOk) {
+    Serial.printf("Temperatura: %.1f C | Umidade do ar: %.1f %%\n", temperatura, umidadeAr);
+  }
+  Serial.printf("Vazao: %.2f L/min | Total acumulado: %.2f L\n", vazaoLPM_local, totalLitros_local);
+  Serial.printf("Bomba: %s | Modo: %s\n",
+                bombaLigada ? "LIGADA" : "DESLIGADA",
+                MODO_AUTOMATICO ? "AUTOMATICO" : "MANUAL");
+  if (alertaDesperdicio) Serial.println("ALERTA: possivel desperdicio (bomba ligada sem vazao).");
+}
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// ===================== CONTROLE DO ATUADOR =====================
+void acionarBomba(bool ligar) {
+  bombaLigada = ligar;
+  digitalWrite(PIN_RELE_BOMBA, ligar ? HIGH : LOW);
+}
+
+// ===================== CALLBACKS DO ARDUINO IOT CLOUD =====================
+// Disparados automaticamente quando o usuário altera os valores pelo
+// Dashboard do Arduino IoT Cloud (variáveis com permissão de escrita).
+
+void onBombaLigadaChange() {
+  digitalWrite(PIN_RELE_BOMBA, bombaLigada ? HIGH : LOW);
+  Serial.printf(">> [Cloud] Bomba %s\n", bombaLigada ? "LIGADA" : "DESLIGADA");
+}
